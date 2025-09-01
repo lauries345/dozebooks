@@ -71,9 +71,17 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
   // Current bounded end
   Duration? _windowEnd;
 
-  // Fades
-  final _fadeInDur = const Duration(milliseconds: 900);
-  final _fadeOutDur = const Duration(milliseconds: 700);
+  // Fade options + state (now mutable)
+  final _fadeOptions = const <Duration>[
+    Duration(milliseconds: 500),
+    Duration(milliseconds: 1000),
+    Duration(milliseconds: 2000),
+    Duration(milliseconds: 5000),
+    Duration(milliseconds: 10000),
+  ];
+  Duration _fadeInDur = const Duration(milliseconds: 1000);
+  Duration _fadeOutDur = const Duration(milliseconds: 5000);
+
   double _targetVolume = 1.0;
   double _currVolume = 1.0;
   int _fadeGen = 0;
@@ -510,6 +518,23 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
         title: const Text('BookShuffle (phone-ready)'),
         centerTitle: true,
       ),
+
+      // >>> Bottom "Select files" button <<<
+      bottomNavigationBar: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+          child: FilledButton.icon(
+            onPressed: _pickAndAddFiles,
+            icon: const Icon(Icons.library_add),
+            label: const Text('Select files'),
+            style: FilledButton.styleFrom(
+              minimumSize: const Size.fromHeight(48),
+            ),
+          ),
+        ),
+      ),
+
       body: SafeArea(
         child: SingleChildScrollView(
           padding: EdgeInsets.fromLTRB(
@@ -533,11 +558,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
                           'Start marks: ${_startMarks.length} • '
                           'Window: ${_windowLen.inMinutes} min',
                         ),
-                  trailing: FilledButton.icon(
-                    onPressed: _pickAndAddFiles,
-                    icon: const Icon(Icons.library_add),
-                    label: const Text('Add files'),
-                  ),
+                  // moved the add/select files button to bottomNavigationBar
                 ),
               ),
               const SizedBox(height: 12),
@@ -567,6 +588,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
 
               const SizedBox(height: 12),
 
+              // Window length selector
               Row(
                 children: [
                   const Text('Play window:'),
@@ -594,6 +616,43 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
               ),
               const SizedBox(height: 12),
 
+              // Fade selectors
+              Row(
+                children: [
+                  const Text('Fade in:'),
+                  const SizedBox(width: 12),
+                  DropdownButton<Duration>(
+                    value: _fadeInDur,
+                    items: _fadeOptions
+                        .map((d) => DropdownMenuItem(
+                              value: d,
+                              child: Text('${d.inMilliseconds} ms'),
+                            ))
+                        .toList(),
+                    onChanged: (val) {
+                      if (val != null) setState(() => _fadeInDur = val);
+                    },
+                  ),
+                  const SizedBox(width: 32),
+                  const Text('Fade out:'),
+                  const SizedBox(width: 12),
+                  DropdownButton<Duration>(
+                    value: _fadeOutDur,
+                    items: _fadeOptions
+                        .map((d) => DropdownMenuItem(
+                              value: d,
+                              child: Text('${d.inMilliseconds} ms'),
+                            ))
+                        .toList(),
+                    onChanged: (val) {
+                      if (val != null) setState(() => _fadeOutDur = val);
+                    },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+
+              // Position slider
               StreamBuilder<Duration>(
                 stream: _player.positionStream,
                 builder: (context, snap) {
@@ -647,6 +706,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
 
               const SizedBox(height: 16),
 
+              // Controls
               Wrap(
                 alignment: WrapAlignment.center,
                 spacing: 12,
@@ -696,6 +756,8 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
                   ),
                 ],
               ),
+              // Extra bottom padding so scrollable content clears the bottom button
+              const SizedBox(height: 80),
             ],
           ),
         ),
