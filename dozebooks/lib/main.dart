@@ -1,12 +1,13 @@
 // lib/main.dart
 import 'dart:async';
 import 'dart:math';
-import 'dart:io' show File;
+import 'dart:io' show File, Directory, Platform;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:audio_session/audio_session.dart';
+import 'package:permission_handler/permission_handler.dart'; // <-- add this
 
 // Desktop backend swap; on mobile it's a no-op.
 import 'package:just_audio_media_kit/just_audio_media_kit.dart';
@@ -158,8 +159,44 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     super.dispose();
   }
 
-  // ================= File picking (mobile-friendly) =================
+  // ================= File/folder picking =================
 
+  /// User entrypoint: choose to add files or a whole folder.
+  Future<void> _addFilesOrFolder() async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.insert_drive_file),
+                title: const Text('Add file(s)'),
+                subtitle: const Text('Pick one or more audio files'),
+                onTap: () => Navigator.pop(ctx, 'files'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.folder),
+                title: const Text('Add folder'),
+                subtitle: const Text('Recursively import supported audio files'),
+                onTap: () => Navigator.pop(ctx, 'folder'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+
+    if (choice == 'files') {
+      await _pickAndAddFiles();
+    } else if (choice == 'folder') {
+      await _pickAndAddFolder();
+    }
+  }
+
+  /// Pick single/multiple files and add them.
   Future<void> _pickAndAddFiles() async {
     try {
       final result = await FilePicker.platform.pickFiles(
@@ -169,7 +206,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
       );
       if (result == null || result.files.isEmpty) return;
 
-      bool addedAny = false;
+      var addedAny = false;
 
       for (final f in result.files) {
         final uri = _resolveUriFromPlatformFile(f);
@@ -181,32 +218,8 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
           }
           continue;
         }
-
-        // Skip duplicates
-        if (_books.any((b) => b.uri.toString() == uri.toString())) continue;
-
-        final dur = await _probeDuration(uri);
-        if (dur == null) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('Could not read duration for ${f.name}')),
-            );
-          }
-          continue;
-        }
-
-        final marks = _buildStartMarks(dur, _gridIncrement);
-        if (marks.isEmpty) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('File too short for 1-min shuffle: ${f.name}')),
-            );
-          }
-          continue;
-        }
-
-        _books.add(_Book(name: f.name, uri: uri, duration: dur, marks: marks));
-        addedAny = true;
+        final ok = await _addOneUri(uri, displayName: f.name);
+        addedAny = addedAny || ok;
       }
 
       if (!addedAny) return;
@@ -222,6 +235,146 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
         SnackBar(content: Text('Failed to add files: $e')),
       );
     }
+  }
+
+  /// Pick a directory and add all supported audio files recursively.
+  Future<void> _pickAndAddFolder() async {
+    try {
+      // Android: ensure we can enumerate external storage
+      if (Platform.isAndroid) {
+        final ok = await _ensureFolderAccess();
+        if (!ok) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Permission denied. Cannot scan folder.')),
+            );
+          }
+          return;
+        }
+      }
+
+      final dirPath = await FilePicker.platform.getDirectoryPath();
+      if (dirPath == null || dirPath.isEmpty) return;
+
+      // Storage Access Framework picks can look like content://... (not traversable via dart:io)
+      if (dirPath.startsWith('content://')) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'That folder is provided via Android’s Storage Access Framework. '
+                'Recursive scanning isn’t supported here yet. Use “Add file(s)” for now.',
+              ),
+            ),
+          );
+        }
+        return;
+      }
+
+      final dir = Directory(dirPath);
+      if (!dir.existsSync()) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Folder not found: $dirPath')),
+          );
+        }
+        return;
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Scanning: $dirPath')),
+        );
+      }
+
+      var added = 0;
+      await for (final ent in dir.list(recursive: true, followLinks: false)) {
+        if (ent is File && _isAudioPath(ent.path)) {
+          final uri = Uri.file(ent.path);
+          final ok = await _addOneUri(uri);
+          if (ok) added++;
+        }
+      }
+
+      if (added == 0) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Found no addable audio (or durations were unreadable). '
+                'Try “Add file(s)” or open a different folder.',
+              ),
+            ),
+          );
+        }
+        return;
+      }
+
+      if (_currentBookIndex == null && _books.isNotEmpty) {
+        await _switchToBook(0, autoplay: false);
+      } else {
+        setState(() {}); // refresh list
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Added $added file(s).')),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to add folder: $e')),
+      );
+    }
+  }
+
+  /// Android 13+: READ_MEDIA_AUDIO; <=12: READ_EXTERNAL_STORAGE
+  Future<bool> _ensureFolderAccess() async {
+    try {
+      final results = await [Permission.audio, Permission.storage].request();
+      final audioOk = results[Permission.audio]?.isGranted ?? false;
+      final storageOk = results[Permission.storage]?.isGranted ?? false;
+      return audioOk || storageOk;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  bool _isAudioPath(String path) {
+    final l = path.toLowerCase();
+    return l.endsWith('.m4b') || l.endsWith('.m4a') || l.endsWith('.mp3')
+        || l.endsWith('.aac') || l.endsWith('.wav') || l.endsWith('.ogg');
+  }
+
+  /// Centralized "add this URI if valid" used by both file/folder flows.
+  Future<bool> _addOneUri(Uri uri, {String? displayName}) async {
+    // Skip duplicates
+    if (_books.any((b) => b.uri.toString() == uri.toString())) return false;
+
+    final dur = await _probeDuration(uri);
+    if (dur == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not read duration for ${displayName ?? uri.toString()}')),
+        );
+      }
+      return false;
+    }
+
+    final marks = _buildStartMarks(dur, _gridIncrement);
+    if (marks.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('File too short for 1-min shuffle: ${displayName ?? uri.toString()}')),
+        );
+      }
+      return false;
+    }
+
+    final name = displayName ?? _guessDisplayName(uri);
+    _books.add(_Book(name: name, uri: uri, duration: dur, marks: marks));
+    return true;
   }
 
   /// Try to get a usable URI from FilePicker's PlatformFile on mobile/desktop.
@@ -240,15 +393,37 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     return null;
   }
 
+  String _guessDisplayName(Uri uri) {
+    if (uri.scheme == 'file') {
+      final path = uri.toFilePath();
+      final sep = Platform.pathSeparator;
+      final idx = path.lastIndexOf(sep);
+      return (idx >= 0 && idx + 1 < path.length) ? path.substring(idx + 1) : path;
+    }
+    // Fallback for content:// or other schemes
+    if (uri.pathSegments.isNotEmpty) return uri.pathSegments.last;
+    return uri.toString();
+  }
+
+  /// More tolerant duration probe: waits briefly on durationStream (nullable-safe).
   Future<Duration?> _probeDuration(Uri uri) async {
     final p = AudioPlayer();
     try {
-      final d = await p.setAudioSource(AudioSource.uri(uri));
+      await p.setVolume(0.0); // silent
+      final maybe = await p.setAudioSource(AudioSource.uri(uri));
+      if (maybe != null) return maybe;
+
+      // If initial set didn't yield a duration, wait (up to 3s) for the stream to report one.
+      final Duration? d = await p.durationStream
+          .firstWhere((d) => d != null)
+          .timeout(const Duration(seconds: 3), onTimeout: () => null);
       return d;
     } catch (_) {
       return null;
     } finally {
-      await p.dispose().onError((_, __) {});
+      try {
+        await p.dispose();
+      } catch (_) {}
     }
   }
 
@@ -490,6 +665,137 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     await _player.setVolume(_targetVolume);
   }
 
+  // ================= Settings Sheet =================
+
+  Future<void> _openSettings() async {
+    final result = await showModalBottomSheet<_SettingsResult>(
+      context: context,
+      showDragHandle: true,
+      useSafeArea: true,
+      builder: (ctx) {
+        var tempWindow = _windowLen;
+        var tempFadeIn = _fadeInDur;
+        var tempFadeOut = _fadeOutDur;
+
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            return Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text('Settings', style: Theme.of(context).textTheme.titleLarge),
+                  const SizedBox(height: 16),
+
+                  // Play window
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Play window'),
+                    subtitle: const Text('Length of each randomized segment'),
+                    trailing: DropdownButton<Duration>(
+                      value: tempWindow,
+                      items: _windowOptions
+                          .map((d) => DropdownMenuItem(
+                                value: d,
+                                child: Text('${d.inMinutes} min'),
+                              ))
+                          .toList(),
+                      onChanged: (val) => setSheetState(() {
+                        if (val != null) tempWindow = val;
+                      }),
+                    ),
+                  ),
+                  const Divider(height: 1),
+
+                  // Fade in
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Fade in'),
+                    subtitle: const Text('Ramp up volume at start'),
+                    trailing: DropdownButton<Duration>(
+                      value: tempFadeIn,
+                      items: _fadeOptions
+                          .map((d) => DropdownMenuItem(
+                                value: d,
+                                child: Text('${d.inMilliseconds} ms'),
+                              ))
+                          .toList(),
+                      onChanged: (val) => setSheetState(() {
+                        if (val != null) tempFadeIn = val;
+                      }),
+                    ),
+                  ),
+                  const Divider(height: 1),
+
+                  // Fade out
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Fade out'),
+                    subtitle: const Text('Ramp down volume at end'),
+                    trailing: DropdownButton<Duration>(
+                      value: tempFadeOut,
+                      items: _fadeOptions
+                          .map((d) => DropdownMenuItem(
+                                value: d,
+                                child: Text('${d.inMilliseconds} ms'),
+                              ))
+                          .toList(),
+                      onChanged: (val) => setSheetState(() {
+                        if (val != null) tempFadeOut = val;
+                      }),
+                    ),
+                  ),
+
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(ctx),
+                        child: const Text('Cancel'),
+                      ),
+                      const SizedBox(width: 8),
+                      FilledButton(
+                        onPressed: () {
+                          Navigator.pop(
+                            ctx,
+                            _SettingsResult(
+                              window: tempWindow,
+                              fadeIn: tempFadeIn,
+                              fadeOut: tempFadeOut,
+                            ),
+                          );
+                        },
+                        child: const Text('Save'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+
+    if (!mounted || result == null) return;
+
+    setState(() {
+      _windowLen = result.window;
+      _fadeInDur = result.fadeIn;
+      _fadeOutDur = result.fadeOut;
+      _segmentFadeStarted = false;
+    });
+
+    // If we’re in the middle of a window, re-bound its end.
+    if (_windowEnd != null && _duration != null) {
+      final pos = _player.position;
+      var newEnd = pos + _windowLen;
+      if (newEnd > _duration!) newEnd = _duration!;
+      setState(() => _windowEnd = newEnd);
+    }
+  }
+
   // ================= UI helpers =================
 
   String _fmt(Duration d) {
@@ -515,19 +821,26 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('BookShuffle (phone-ready)'),
+        title: const Text('dozeBooks'),
         centerTitle: true,
+        actions: [
+          IconButton(
+            tooltip: 'Settings',
+            icon: const Icon(Icons.settings),
+            onPressed: _openSettings,
+          ),
+        ],
       ),
 
-      // >>> Bottom "Select files" button <<<
+      // >>> Bottom "Add files or folder" button <<<
       bottomNavigationBar: SafeArea(
         top: false,
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
           child: FilledButton.icon(
-            onPressed: _pickAndAddFiles,
+            onPressed: _addFilesOrFolder,
             icon: const Icon(Icons.library_add),
-            label: const Text('Select files'),
+            label: const Text('Add files or folder'),
             style: FilledButton.styleFrom(
               minimumSize: const Size.fromHeight(48),
             ),
@@ -558,7 +871,6 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
                           'Start marks: ${_startMarks.length} • '
                           'Window: ${_windowLen.inMinutes} min',
                         ),
-                  // moved the add/select files button to bottomNavigationBar
                 ),
               ),
               const SizedBox(height: 12),
@@ -586,70 +898,6 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
                   ),
                 ),
 
-              const SizedBox(height: 12),
-
-              // Window length selector
-              Row(
-                children: [
-                  const Text('Play window:'),
-                  const SizedBox(width: 12),
-                  DropdownButton<Duration>(
-                    value: _windowLen,
-                    items: _windowOptions
-                        .map((d) => DropdownMenuItem(value: d, child: Text('${d.inMinutes} min')))
-                        .toList(),
-                    onChanged: (val) async {
-                      if (val == null) return;
-                      setState(() {
-                        _windowLen = val;
-                        _segmentFadeStarted = false;
-                      });
-                      if (_windowEnd != null && _duration != null) {
-                        final pos = _player.position;
-                        var newEnd = pos + _windowLen;
-                        if (newEnd > _duration!) newEnd = _duration!;
-                        setState(() => _windowEnd = newEnd);
-                      }
-                    },
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-
-              // Fade selectors
-              Row(
-                children: [
-                  const Text('Fade in:'),
-                  const SizedBox(width: 12),
-                  DropdownButton<Duration>(
-                    value: _fadeInDur,
-                    items: _fadeOptions
-                        .map((d) => DropdownMenuItem(
-                              value: d,
-                              child: Text('${d.inMilliseconds} ms'),
-                            ))
-                        .toList(),
-                    onChanged: (val) {
-                      if (val != null) setState(() => _fadeInDur = val);
-                    },
-                  ),
-                  const SizedBox(width: 32),
-                  const Text('Fade out:'),
-                  const SizedBox(width: 12),
-                  DropdownButton<Duration>(
-                    value: _fadeOutDur,
-                    items: _fadeOptions
-                        .map((d) => DropdownMenuItem(
-                              value: d,
-                              child: Text('${d.inMilliseconds} ms'),
-                            ))
-                        .toList(),
-                    onChanged: (val) {
-                      if (val != null) setState(() => _fadeOutDur = val);
-                    },
-                  ),
-                ],
-              ),
               const SizedBox(height: 12),
 
               // Position slider
@@ -776,5 +1024,16 @@ class _Book {
     required this.uri,
     required this.duration,
     required this.marks,
+  });
+}
+
+class _SettingsResult {
+  final Duration window;
+  final Duration fadeIn;
+  final Duration fadeOut;
+  const _SettingsResult({
+    required this.window,
+    required this.fadeIn,
+    required this.fadeOut,
   });
 }
