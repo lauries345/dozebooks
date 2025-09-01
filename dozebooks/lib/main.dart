@@ -20,10 +20,21 @@ void main() {
   JustAudioMediaKit.mpvLogLevel = MPVLogLevel.error;
   JustAudioMediaKit.ensureInitialized();
 
-  runApp(const MaterialApp(
+  runApp(MaterialApp(
     debugShowCheckedModeBanner: false,
     title: 'BookShuffle',
-    home: OneScreenAudiobook(),
+    themeMode: ThemeMode.dark, // <<< Force dark theme
+    theme: ThemeData(
+      colorSchemeSeed: Colors.indigo,
+      useMaterial3: true,
+      brightness: Brightness.light,
+    ),
+    darkTheme: ThemeData(
+      colorSchemeSeed: Colors.indigo,
+      useMaterial3: true,
+      brightness: Brightness.dark,
+    ),
+    home: const OneScreenAudiobook(),
   ));
 }
 
@@ -859,48 +870,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Card(
-                elevation: 2,
-                child: ListTile(
-                  title: Text(currentName),
-                  subtitle: (_books.isEmpty || dur == null)
-                      ? Text('Files loaded: ${_books.length}. Load .m4b/.m4a/.mp3 to begin.')
-                      : Text(
-                          'Files: ${_books.length} • '
-                          'Duration: ${_fmt(dur)} • '
-                          'Start marks: ${_startMarks.length} • '
-                          'Window: ${_windowLen.inMinutes} min',
-                        ),
-                ),
-              ),
-              const SizedBox(height: 12),
-
-              if (_books.isNotEmpty)
-                Material(
-                  elevation: 1,
-                  borderRadius: BorderRadius.circular(8),
-                  child: ListView.separated(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    itemCount: _books.length,
-                    separatorBuilder: (_, __) => const Divider(height: 1),
-                    itemBuilder: (context, i) {
-                      final b = _books[i];
-                      final selected = i == _currentBookIndex;
-                      return ListTile(
-                        selected: selected,
-                        leading: Icon(selected ? Icons.playlist_play : Icons.audiotrack),
-                        title: Text(b.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-                        subtitle: Text('Duration: ${_fmt(b.duration)} • marks: ${b.marks.length}'),
-                        onTap: () async => _switchToBook(i, autoplay: false),
-                      );
-                    },
-                  ),
-                ),
-
-              const SizedBox(height: 12),
-
-              // Position slider
+              // ===== Position slider first =====
               StreamBuilder<Duration>(
                 stream: _player.positionStream,
                 builder: (context, snap) {
@@ -941,69 +911,128 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
               const SizedBox(height: 12),
 
               if (_currentMarkIndex != null && _duration != null)
-                Text(
-                  () {
-                    final start = _startMarks[_currentMarkIndex!];
-                    final shownEnd = _windowEnd ?? (start + _windowLen);
-                    final bounded = _minDuration(shownEnd - start, _windowLen);
-                    return 'Current window: ${_fmt(start)} → ${_fmt(shownEnd)} '
-                        '(${bounded.inMinutes} min)';
-                  }(),
-                  style: theme.textTheme.bodyMedium,
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text(
+                    () {
+                      final start = _startMarks[_currentMarkIndex!];
+                      final shownEnd = _windowEnd ?? (start + _windowLen);
+                      final bounded = _minDuration(shownEnd - start, _windowLen);
+                      return 'Current window: ${_fmt(start)} → ${_fmt(shownEnd)} '
+                          '(${bounded.inMinutes} min)';
+                    }(),
+                    style: theme.textTheme.bodyMedium,
+                  ),
                 ),
 
-              const SizedBox(height: 16),
-
-              // Controls
-              Wrap(
-                alignment: WrapAlignment.center,
-                spacing: 12,
-                runSpacing: 8,
+              // ===== Controls =====
+              // Row 1: two shuffle buttons on the same line
+              Row(
                 children: [
-                  FilledButton.tonalIcon(
-                    onPressed: (_duration != null && _startMarks.isNotEmpty)
-                        ? _shuffleCurrent
-                        : null,
-                    icon: const Icon(Icons.shuffle),
-                    label: const Text('Shuffle (current)'),
-                  ),
-                  FilledButton.tonalIcon(
-                    onPressed: _books.isNotEmpty ? _shuffleAll : null,
-                    icon: const Icon(Icons.all_inclusive),
-                    label: const Text('Shuffle (all files)'),
-                  ),
-                  FilledButton.icon(
-                    onPressed: (_duration != null)
-                        ? () async {
-                            if (_player.playing) {
-                              await _pauseWithFadeOut();
-                            } else {
-                              // Mirror Shuffle’s reliability on resume
-                              await _preKickSeek();
-                              await _playWithFadeIn();
-                            }
-                          }
-                        : null,
-                    icon: StreamBuilder<bool>(
-                      stream: _player.playingStream,
-                      builder: (_, snap) =>
-                          Icon((snap.data ?? false) ? Icons.pause : Icons.play_arrow),
+                  Expanded(
+                    child: FilledButton.tonalIcon(
+                      onPressed: (_duration != null && _startMarks.isNotEmpty)
+                          ? _shuffleCurrent
+                          : null,
+                      icon: const Icon(Icons.shuffle),
+                      label: const Text('Shuffle (current)'),
                     ),
-                    label: const Text('Play/Pause'),
                   ),
-                  IconButton.filledTonal(
-                    tooltip: 'Stop',
-                    onPressed: (_duration != null)
-                        ? () async {
-                            _windowEnd = null;
-                            _segmentFadeStarted = false;
-                            await _stopWithFadeOut();
-                          }
-                        : null,
-                    icon: const Icon(Icons.stop),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: FilledButton.tonalIcon(
+                      onPressed: _books.isNotEmpty ? _shuffleAll : null,
+                      icon: const Icon(Icons.all_inclusive),
+                      label: const Text('Shuffle (all files)'),
+                    ),
                   ),
                 ],
               ),
+              const SizedBox(height: 10),
+
+              // Row 2: play/pause and stop on the same line
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: (_duration != null)
+                          ? () async {
+                              if (_player.playing) {
+                                await _pauseWithFadeOut();
+                              } else {
+                                // Mirror Shuffle’s reliability on resume
+                                await _preKickSeek();
+                                await _playWithFadeIn();
+                              }
+                            }
+                          : null,
+                      icon: StreamBuilder<bool>(
+                        stream: _player.playingStream,
+                        builder: (_, snap) =>
+                            Icon((snap.data ?? false) ? Icons.pause : Icons.play_arrow),
+                      ),
+                      label: const Text('Play/Pause'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: FilledButton.tonalIcon(
+                      onPressed: (_duration != null)
+                          ? () async {
+                              _windowEnd = null;
+                              _segmentFadeStarted = false;
+                              await _stopWithFadeOut();
+                            }
+                          : null,
+                      icon: const Icon(Icons.stop),
+                      label: const Text('Stop'),
+                    ),
+                  ),
+                ],
+              ),
+
+              const SizedBox(height: 16),
+
+              // ===== File info & list BELOW the buttons =====
+              Card(
+                elevation: 2,
+                child: ListTile(
+                  title: Text(currentName),
+                  subtitle: (_books.isEmpty || dur == null)
+                      ? Text('Files loaded: ${_books.length}. Load .m4b/.m4a/.mp3 to begin.')
+                      : Text(
+                          'Files: ${_books.length} • '
+                          'Duration: ${_fmt(dur)} • '
+                          'Start marks: ${_startMarks.length} • '
+                          'Window: ${_windowLen.inMinutes} min',
+                        ),
+                ),
+              ),
+              const SizedBox(height: 12),
+
+              if (_books.isNotEmpty)
+                Material(
+                  elevation: 1,
+                  borderRadius: BorderRadius.circular(8),
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    itemCount: _books.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (context, i) {
+                      final b = _books[i];
+                      final selected = i == _currentBookIndex;
+                      return ListTile(
+                        selected: selected,
+                        leading: Icon(selected ? Icons.playlist_play : Icons.audiotrack),
+                        title: Text(b.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        subtitle: Text('Duration: ${_fmt(b.duration)} • marks: ${b.marks.length}'),
+                        onTap: () async => _switchToBook(i, autoplay: false),
+                      );
+                    },
+                  ),
+                ),
+
               // Extra bottom padding so scrollable content clears the bottom button
               const SizedBox(height: 80),
             ],
