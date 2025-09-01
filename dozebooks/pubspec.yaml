@@ -1,46 +1,18 @@
-name: doze_books
-description: "Minimal M4B audiobook player with smart shuffle, sleep timer, and LibriVox downloads."
+name: audiobook_shuffle
+description: Single-screen audiobook player with 20-min shuffle segments
 publish_to: "none"
-version: 0.1.0+1
-
 environment:
-  sdk: ">=3.3.0 <4.0.0"
+  sdk: ">=3.5.0 <4.0.0"
 
 dependencies:
   flutter:
     sdk: flutter
-
-  # State / utilities
-  provider: ^6.1.2
-  path_provider: ^2.1.4
-  permission_handler: ^12.0.1
-  uuid: ^4.5.1
-
-  # Networking / downloads
-  dio: ^5.5.0+1
-
-  # Audio
   just_audio: ^0.10.4
-  just_audio_windows: ^0.2.2   # for Windows desktop
-  #just_audio_macos: ^0.2.3     # (optional) for macOS
-  #just_audio_linux: ^0.1.12    # (optional) for Linux
-  audio_session: ^0.2.2
-  audio_service: ^0.18.18
-
-  # Ads & IAP
-  #google_mobile_ads: ^5.1.0
-  in_app_purchase: ^3.2.0
-
-  # File picking
   file_picker: ^10.3.2
 
-  # JSON
-  collection: ^1.18.0
-
-dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^6.0.0
+  # Use media_kit as the Windows (and Linux) backend for just_audio
+  just_audio_media_kit: ^2.1.0
+  media_kit_libs_windows_audio: any   # bundles libmpv for Windows
 
 flutter:
   uses-material-design: true
