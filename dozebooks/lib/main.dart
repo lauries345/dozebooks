@@ -36,6 +36,8 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
   final _player = AudioPlayer();
   final _rng = Random();
 
+  AudioSession? _session;
+
   // Multi-file library
   final List<_Book> _books = [];
   int? _currentBookIndex;
@@ -43,7 +45,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
   // Current track info
   Duration? _duration;
   List<Duration> _startMarks = const []; // 1-min grid
-  int? _currentMarkIndex;               // index into _startMarks
+  int? _currentMarkIndex; // index into _startMarks
   String? _fileName;
 
   Duration _minDuration(Duration a, Duration b) => (a <= b) ? a : b;
@@ -55,6 +57,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
   // Adjustable play window (default 20 min)
   Duration _windowLen = const Duration(minutes: 20);
   final _windowOptions = const <Duration>[
+    Duration(minutes: 1),
     Duration(minutes: 5),
     Duration(minutes: 10),
     Duration(minutes: 15),
@@ -91,22 +94,28 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
 
   Future<void> _initAudioSession() async {
     try {
-      final session = await AudioSession.instance;
-      await session.configure(const AudioSessionConfiguration.music());
+      _session = await AudioSession.instance;
+      await _session!.configure(const AudioSessionConfiguration.music());
 
       // Android: prefer speaker, look like media playback
-      await _player.setAndroidAudioAttributes(const AndroidAudioAttributes(
-        contentType: AndroidAudioContentType.music,
-        usage: AndroidAudioUsage.media,
-        flags: AndroidAudioFlags.none,
-      ));
+      try {
+        await _player.setAndroidAudioAttributes(const AndroidAudioAttributes(
+          contentType: AndroidAudioContentType.music,
+          usage: AndroidAudioUsage.media,
+          flags: AndroidAudioFlags.none,
+        ));
+      } catch (_) {}
 
-      // Optional: pause if audio route changes to "noisy" (e.g., headphones unplugged)
-      session.becomingNoisyEventStream.listen((_) {
+      // Avoid added latency/edge cases (best-effort; older versions may no-op)
+      try {
+        await _player.setSkipSilenceEnabled(false);
+      } catch (_) {}
+
+      // Pause if route becomes noisy (e.g., headphones unplugged)
+      _session!.becomingNoisyEventStream.listen((_) {
         _player.pause();
       });
     } catch (e) {
-      // Safe to ignore if platform doesn't support or plugin not available
       debugPrint('AudioSession init warning: $e');
     }
   }
@@ -120,8 +129,11 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
         remaining > Duration.zero &&
         remaining <= _fadeOutDur) {
       _segmentFadeStarted = true;
+      // Cancel any in-flight fade, then start the end fade.
+      _fadeGen++;
       unawaited(_fadeTo(0.0, remaining));
     }
+
     if (remaining <= const Duration(milliseconds: 120)) {
       _segmentFadeStarted = false;
       _windowEnd = null;
@@ -146,7 +158,6 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
         type: FileType.custom,
         allowedExtensions: const ['m4b', 'm4a', 'mp3'],
         allowMultiple: true,
-        // withData: true, // enable only if you must support providers with no path/uri (can be memory heavy)
       );
       if (result == null || result.files.isEmpty) return;
 
@@ -155,13 +166,6 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
       for (final f in result.files) {
         final uri = _resolveUriFromPlatformFile(f);
         if (uri == null) {
-          // As a last resort (COMMENTED OUT to avoid big RAM usage):
-          // if (f.bytes != null) {
-          //   final dir = await getTemporaryDirectory();
-          //   final file = File('${dir.path}/${f.name}');
-          //   await file.writeAsBytes(f.bytes!, flush: true);
-          //   uri = Uri.file(file.path);
-          // }
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(content: Text('Could not access: ${f.name}')),
@@ -218,14 +222,13 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     if (f.path != null && f.path!.isNotEmpty && File(f.path!).existsSync()) {
       return Uri.file(f.path!);
     }
-    // 2) Some providers expose a content:// (Android) or file:// URI in identifier
+    // 2) content:// (Android) or file:// in identifier
     if (f.identifier != null && f.identifier!.isNotEmpty) {
       final maybe = Uri.tryParse(f.identifier!);
       if (maybe != null && (maybe.scheme == 'content' || maybe.scheme == 'file')) {
         return maybe;
       }
     }
-    // 3) Give up (or handle f.bytes by copying to temp — see commented code above)
     return null;
   }
 
@@ -256,7 +259,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     _fadeGen++; // cancel fades
     await _player.pause();
 
-    await _player.setAudioSource(AudioSource.uri(b.uri));
+    await _player.setAudioSource(AudioSource.uri(b.uri), preload: true);
 
     setState(() {
       _currentBookIndex = idx;
@@ -352,10 +355,10 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     _lastMarkIdx = markIdx;
   }
 
-  // ================= Fades =================
+  // ================= Fades & kickstarts =================
 
   Future<void> _fadeTo(double target, Duration dur) async {
-    _fadeGen++;
+    // NOTE: do NOT bump _fadeGen here; callers control cancellation.
     final gen = _fadeGen;
 
     final start = _currVolume;
@@ -366,11 +369,12 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
       return;
     }
 
-    // Slightly slower loop to reduce platform message spam; still feels smooth
-    const frame = Duration(milliseconds: 40); // ~25 FPS
-    final steps = (dur.inMilliseconds / frame.inMilliseconds).ceil().clamp(1, 200);
+    const Duration frame = Duration(milliseconds: 40); // ~25 FPS
+    final int stepsRaw = (dur.inMilliseconds / frame.inMilliseconds).ceil();
+    final int steps = (stepsRaw.clamp(1, 200)) as int;
+
     for (var i = 1; i <= steps; i++) {
-      if (gen != _fadeGen) return;
+      if (gen != _fadeGen) return; // cancelled by a new fade
       final t = i / steps;
       final v = (start + delta * t).clamp(0.0, 1.0);
       _currVolume = v;
@@ -379,15 +383,68 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     }
   }
 
+  // Strong pre-kick so Play behaves like Shuffle.
+  Future<void> _preKickSeek() async {
+    try {
+      final pos = _player.position;
+      final dur = _duration;
+
+      // If at/near 0, jump +200ms; otherwise keep current pos.
+      const bump = Duration(milliseconds: 200);
+      const nearZero = Duration(milliseconds: 20);
+      Duration to = pos <= nearZero ? bump : pos;
+
+      if (dur != null) {
+        final maxTo = dur - const Duration(milliseconds: 250);
+        if (to >= maxTo) {
+          to = maxTo > Duration.zero ? maxTo : Duration.zero;
+        }
+      }
+      await _player.seek(to);
+    } catch (_) {
+      // best-effort
+    }
+  }
+
+  // If playback reports "running" but no frames flow, nudge decisively.
+  Future<void> _kickIfStalled() async {
+    try {
+      if (!_player.playing) return;
+
+      final before = _player.position;
+      await Future.delayed(const Duration(milliseconds: 350));
+      final after = _player.position;
+
+      // Not advancing by at least ~30ms? Give it a real bump.
+      if (after - before < const Duration(milliseconds: 30)) {
+        final dur = _duration;
+        const bump = Duration(milliseconds: 200);
+        var to = before + bump;
+        if (dur != null) {
+          final maxTo = dur - const Duration(milliseconds: 250);
+          if (to >= maxTo) to = maxTo > Duration.zero ? maxTo : Duration.zero;
+        }
+        await _player.seek(to);
+
+        // Some devices respond to a brief speed tickle
+        try {
+          await _player.setSpeed(1.01);
+          await Future.delayed(const Duration(milliseconds: 60));
+          await _player.setSpeed(1.0);
+        } catch (_) {}
+      }
+    } catch (_) {
+      // ignore
+    }
+  }
+
   Future<void> _playWithFadeIn() async {
     _fadeGen++;
 
-    // Kick the audio path with a non-zero "epsilon" volume to avoid silent start
-    const epsilon = 0.003;
-    _currVolume = epsilon;
-    await _player.setVolume(epsilon);
+    try {
+      await _session?.setActive(true);
+    } catch (_) {}
 
-    // Ensure backend is ready (esp. on mobile) before starting fade
     if (_player.processingState != ProcessingState.ready &&
         _player.processingState != ProcessingState.buffering) {
       await _player.processingStateStream.firstWhere(
@@ -395,12 +452,22 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
       );
     }
 
+    await _preKickSeek();
     await _player.play();
+
+    // Some devices ignore tiny volumes before full playback starts
+    await Future.delayed(const Duration(milliseconds: 100));
+    const epsilon = 0.003;
+    _currVolume = epsilon;
+    await _player.setVolume(epsilon);
+
+    await _kickIfStalled();
     await _fadeTo(_targetVolume, _fadeInDur);
   }
 
   Future<void> _pauseWithFadeOut([Duration? custom]) async {
     final d = custom ?? _fadeOutDur;
+    _fadeGen++; // cancel any other fade
     await _fadeTo(0.0, d);
     await _player.pause();
     _currVolume = _targetVolume;
@@ -408,6 +475,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
   }
 
   Future<void> _stopWithFadeOut() async {
+    _fadeGen++; // cancel any other fade
     await _fadeTo(0.0, _fadeOutDur);
     await _player.stop();
     _currVolume = _targetVolume;
@@ -422,8 +490,8 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     final s = d.inSeconds.remainder(60);
     if (h > 0) {
       return '${h.toString().padLeft(2, '0')}:'
-             '${m.toString().padLeft(2, '0')}:'
-             '${s.toString().padLeft(2, '0')}';
+          '${m.toString().padLeft(2, '0')}:'
+          '${s.toString().padLeft(2, '0')}';
     }
     return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
@@ -442,38 +510,45 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
         title: const Text('BookShuffle (phone-ready)'),
         centerTitle: true,
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            Card(
-              elevation: 2,
-              child: ListTile(
-                title: Text(currentName),
-                subtitle: (_books.isEmpty || dur == null)
-                    ? Text('Files loaded: ${_books.length}. Load .m4b/.m4a/.mp3 to begin.')
-                    : Text(
-                        'Files: ${_books.length} • '
-                        'Duration: ${_fmt(dur)} • '
-                        'Start marks: ${_startMarks.length} • '
-                        'Window: ${_windowLen.inMinutes} min',
-                      ),
-                trailing: FilledButton.icon(
-                  onPressed: _pickAndAddFiles,
-                  icon: const Icon(Icons.library_add),
-                  label: const Text('Add files'),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: EdgeInsets.fromLTRB(
+            16,
+            16,
+            16,
+            16 + MediaQuery.of(context).viewPadding.bottom,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Card(
+                elevation: 2,
+                child: ListTile(
+                  title: Text(currentName),
+                  subtitle: (_books.isEmpty || dur == null)
+                      ? Text('Files loaded: ${_books.length}. Load .m4b/.m4a/.mp3 to begin.')
+                      : Text(
+                          'Files: ${_books.length} • '
+                          'Duration: ${_fmt(dur)} • '
+                          'Start marks: ${_startMarks.length} • '
+                          'Window: ${_windowLen.inMinutes} min',
+                        ),
+                  trailing: FilledButton.icon(
+                    onPressed: _pickAndAddFiles,
+                    icon: const Icon(Icons.library_add),
+                    label: const Text('Add files'),
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(height: 12),
+              const SizedBox(height: 12),
 
-            if (_books.isNotEmpty)
-              Container(
-                constraints: const BoxConstraints(maxHeight: 180),
-                child: Material(
+              if (_books.isNotEmpty)
+                Material(
                   elevation: 1,
                   borderRadius: BorderRadius.circular(8),
                   child: ListView.separated(
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
                     itemCount: _books.length,
                     separatorBuilder: (_, __) => const Divider(height: 1),
                     itemBuilder: (context, i) {
@@ -489,137 +564,140 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
                     },
                   ),
                 ),
-              ),
 
-            const SizedBox(height: 12),
+              const SizedBox(height: 12),
 
-            Row(
-              children: [
-                const Text('Play window:'),
-                const SizedBox(width: 12),
-                DropdownButton<Duration>(
-                  value: _windowLen,
-                  items: _windowOptions
-                      .map((d) => DropdownMenuItem(value: d, child: Text('${d.inMinutes} min')))
-                      .toList(),
-                  onChanged: (val) async {
-                    if (val == null) return;
-                    setState(() {
-                      _windowLen = val;
-                      _segmentFadeStarted = false;
-                    });
-                    if (_windowEnd != null && _duration != null) {
-                      final pos = await _player.position;
-                      var newEnd = pos + _windowLen;
-                      if (newEnd > _duration!) newEnd = _duration!;
-                      setState(() => _windowEnd = newEnd);
-                    }
-                  },
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-
-            StreamBuilder<Duration>(
-              stream: _player.positionStream,
-              builder: (context, snap) {
-                final pos = snap.data ?? Duration.zero;
-                final max = dur?.inMilliseconds.toDouble() ?? 0.0;
-                final value = pos.inMilliseconds.clamp(0, max.toInt()).toDouble();
-
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Slider(
-                      value: max > 0 ? value : 0.0,
-                      max: max > 0 ? max : 1.0,
-                      onChanged: (v) async {
-                        if (dur == null) return;
-                        final seekTo = Duration(milliseconds: v.toInt());
-                        setState(() {
-                          _windowEnd = null;
-                          _segmentFadeStarted = false;
-                        });
-                        _fadeGen++;
-                        _currVolume = _targetVolume;
-                        await _player.setVolume(_targetVolume);
-                        await _player.seek(seekTo);
-                      },
-                    ),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(_fmt(pos), style: theme.textTheme.bodySmall),
-                        Text(_fmt(dur ?? Duration.zero), style: theme.textTheme.bodySmall),
-                      ],
-                    ),
-                  ],
-                );
-              },
-            ),
-            const SizedBox(height: 12),
-
-            if (_currentMarkIndex != null && _duration != null)
-              Text(
-                () {
-                  final start = _startMarks[_currentMarkIndex!];
-                  final shownEnd = _windowEnd ?? (start + _windowLen);
-                  final bounded = _minDuration(shownEnd - start, _windowLen);
-                  return 'Current window: ${_fmt(start)} → ${_fmt(shownEnd)} '
-                         '(${bounded.inMinutes} min)';
-                }(),
-                style: theme.textTheme.bodyMedium,
-              ),
-            const Spacer(),
-
-            Wrap(
-              alignment: WrapAlignment.center,
-              spacing: 12,
-              runSpacing: 8,
-              children: [
-                FilledButton.tonalIcon(
-                  onPressed: (_duration != null && _startMarks.isNotEmpty)
-                      ? _shuffleCurrent
-                      : null,
-                  icon: const Icon(Icons.shuffle),
-                  label: const Text('Shuffle (current)'),
-                ),
-                FilledButton.tonalIcon(
-                  onPressed: _books.isNotEmpty ? _shuffleAll : null,
-                  icon: const Icon(Icons.all_inclusive),
-                  label: const Text('Shuffle (all files)'),
-                ),
-                FilledButton.icon(
-                  onPressed: (_duration != null)
-                      ? () async {
-                          if (_player.playing) {
-                            await _pauseWithFadeOut();
-                          } else {
-                            await _playWithFadeIn();
-                          }
-                        }
-                      : null,
-                  icon: StreamBuilder<bool>(
-                    stream: _player.playingStream,
-                    builder: (_, snap) =>
-                        Icon((snap.data ?? false) ? Icons.pause : Icons.play_arrow),
+              Row(
+                children: [
+                  const Text('Play window:'),
+                  const SizedBox(width: 12),
+                  DropdownButton<Duration>(
+                    value: _windowLen,
+                    items: _windowOptions
+                        .map((d) => DropdownMenuItem(value: d, child: Text('${d.inMinutes} min')))
+                        .toList(),
+                    onChanged: (val) async {
+                      if (val == null) return;
+                      setState(() {
+                        _windowLen = val;
+                        _segmentFadeStarted = false;
+                      });
+                      if (_windowEnd != null && _duration != null) {
+                        final pos = _player.position;
+                        var newEnd = pos + _windowLen;
+                        if (newEnd > _duration!) newEnd = _duration!;
+                        setState(() => _windowEnd = newEnd);
+                      }
+                    },
                   ),
-                  label: const Text('Play/Pause'),
+                ],
+              ),
+              const SizedBox(height: 12),
+
+              StreamBuilder<Duration>(
+                stream: _player.positionStream,
+                builder: (context, snap) {
+                  final pos = snap.data ?? Duration.zero;
+                  final max = dur?.inMilliseconds.toDouble() ?? 0.0;
+                  final value = pos.inMilliseconds.clamp(0, max.toInt()).toDouble();
+
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Slider(
+                        value: max > 0 ? value : 0.0,
+                        max: max > 0 ? max : 1.0,
+                        onChanged: (v) async {
+                          if (dur == null) return;
+                          final seekTo = Duration(milliseconds: v.toInt());
+                          setState(() {
+                            _windowEnd = null;
+                            _segmentFadeStarted = false;
+                          });
+                          _fadeGen++;
+                          _currVolume = _targetVolume;
+                          await _player.setVolume(_targetVolume);
+                          await _player.seek(seekTo);
+                        },
+                      ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(_fmt(pos), style: theme.textTheme.bodySmall),
+                          Text(_fmt(dur ?? Duration.zero), style: theme.textTheme.bodySmall),
+                        ],
+                      ),
+                    ],
+                  );
+                },
+              ),
+              const SizedBox(height: 12),
+
+              if (_currentMarkIndex != null && _duration != null)
+                Text(
+                  () {
+                    final start = _startMarks[_currentMarkIndex!];
+                    final shownEnd = _windowEnd ?? (start + _windowLen);
+                    final bounded = _minDuration(shownEnd - start, _windowLen);
+                    return 'Current window: ${_fmt(start)} → ${_fmt(shownEnd)} '
+                        '(${bounded.inMinutes} min)';
+                  }(),
+                  style: theme.textTheme.bodyMedium,
                 ),
-                IconButton.filledTonal(
-                  tooltip: 'Stop',
-                  onPressed: (_duration != null)
-                      ? () async {
-                          _windowEnd = null;
-                          _segmentFadeStarted = false;
-                          await _stopWithFadeOut();
-                        }
-                      : null,
-                  icon: const Icon(Icons.stop),
-                ),
-              ],
-            ),
-          ],
+
+              const SizedBox(height: 16),
+
+              Wrap(
+                alignment: WrapAlignment.center,
+                spacing: 12,
+                runSpacing: 8,
+                children: [
+                  FilledButton.tonalIcon(
+                    onPressed: (_duration != null && _startMarks.isNotEmpty)
+                        ? _shuffleCurrent
+                        : null,
+                    icon: const Icon(Icons.shuffle),
+                    label: const Text('Shuffle (current)'),
+                  ),
+                  FilledButton.tonalIcon(
+                    onPressed: _books.isNotEmpty ? _shuffleAll : null,
+                    icon: const Icon(Icons.all_inclusive),
+                    label: const Text('Shuffle (all files)'),
+                  ),
+                  FilledButton.icon(
+                    onPressed: (_duration != null)
+                        ? () async {
+                            if (_player.playing) {
+                              await _pauseWithFadeOut();
+                            } else {
+                              // Mirror Shuffle’s reliability on resume
+                              await _preKickSeek();
+                              await _playWithFadeIn();
+                            }
+                          }
+                        : null,
+                    icon: StreamBuilder<bool>(
+                      stream: _player.playingStream,
+                      builder: (_, snap) =>
+                          Icon((snap.data ?? false) ? Icons.pause : Icons.play_arrow),
+                    ),
+                    label: const Text('Play/Pause'),
+                  ),
+                  IconButton.filledTonal(
+                    tooltip: 'Stop',
+                    onPressed: (_duration != null)
+                        ? () async {
+                            _windowEnd = null;
+                            _segmentFadeStarted = false;
+                            await _stopWithFadeOut();
+                          }
+                        : null,
+                    icon: const Icon(Icons.stop),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -628,7 +706,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
 
 class _Book {
   final String name;
-  final Uri uri;            // works for file:// & content://
+  final Uri uri; // works for file:// & content://
   final Duration duration;
   final List<Duration> marks;
   const _Book({
