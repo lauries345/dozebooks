@@ -9,10 +9,12 @@ dependencies:
     sdk: flutter
   just_audio: ^0.10.4
   file_picker: ^10.3.2
-
+  
   # Use media_kit as the Windows (and Linux) backend for just_audio
   just_audio_media_kit: ^2.1.0
   media_kit_libs_windows_audio: any   # bundles libmpv for Windows
+  #just_audio_background: ^0.0.1
+  audio_session: ^0.2.2
 
 flutter:
   uses-material-design: true

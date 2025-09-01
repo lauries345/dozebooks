@@ -1,18 +1,22 @@
 // lib/main.dart
 import 'dart:async';
 import 'dart:math';
+import 'dart:io' show File;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:audio_session/audio_session.dart';
 
-// If you use Windows (recommended backend):
-// pubspec deps: just_audio_media_kit, media_kit_libs_windows_audio
+// Desktop backend swap; on mobile it's a no-op.
 import 'package:just_audio_media_kit/just_audio_media_kit.dart';
+import 'package:media_kit/media_kit.dart'; // MPVLogLevel
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  // Safe no-op on platforms where media_kit isn't used; on Windows it swaps the backend.
+
+  // Silence MPV logs (desktop). On mobile this is ignored.
+  JustAudioMediaKit.mpvLogLevel = MPVLogLevel.error;
   JustAudioMediaKit.ensureInitialized();
 
   runApp(const MaterialApp(
@@ -24,7 +28,6 @@ void main() {
 
 class OneScreenAudiobook extends StatefulWidget {
   const OneScreenAudiobook({super.key});
-
   @override
   State<OneScreenAudiobook> createState() => _OneScreenAudiobookState();
 }
@@ -33,27 +36,25 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
   final _player = AudioPlayer();
   final _rng = Random();
 
-  // Multi-file support
+  // Multi-file library
   final List<_Book> _books = [];
   int? _currentBookIndex;
 
-  Duration? _duration;          // of current book
-  List<Duration> _startMarks = const []; // 1-min grid for current book
-  int? _currentMarkIndex;       // index within _startMarks
-
-  // UI/summary
+  // Current track info
+  Duration? _duration;
+  List<Duration> _startMarks = const []; // 1-min grid
+  int? _currentMarkIndex;               // index into _startMarks
   String? _fileName;
 
-  // Helpers
   Duration _minDuration(Duration a, Duration b) => (a <= b) ? a : b;
 
-  // 1-minute grid for shuffle starts
-  static const Duration _gridIncrement = Duration(minutes: 1);
-  static const Duration _minPlayableTail = Duration(minutes: 1);
+  // 1-min shuffle grid
+  static const _gridIncrement = Duration(minutes: 1);
+  static const _minPlayableTail = Duration(minutes: 1);
 
-  // Adjustable playback window (default 20 min)
+  // Adjustable play window (default 20 min)
   Duration _windowLen = const Duration(minutes: 20);
-  final List<Duration> _windowOptions = const [
+  final _windowOptions = const <Duration>[
     Duration(minutes: 5),
     Duration(minutes: 10),
     Duration(minutes: 15),
@@ -64,18 +65,18 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     Duration(minutes: 60),
   ];
 
-  // Current "bounded" play window end
+  // Current bounded end
   Duration? _windowEnd;
 
   // Fades
-  final Duration _fadeInDur = const Duration(milliseconds: 900);
-  final Duration _fadeOutDur = const Duration(milliseconds: 700);
+  final _fadeInDur = const Duration(milliseconds: 900);
+  final _fadeOutDur = const Duration(milliseconds: 700);
   double _targetVolume = 1.0;
   double _currVolume = 1.0;
-  int _fadeGen = 0; // cancels in-flight fades
+  int _fadeGen = 0;
   bool _segmentFadeStarted = false;
 
-  // For avoiding immediate repeats in "shuffle all"
+  // To avoid instant repeats in "shuffle all"
   int? _lastFileIdx;
   int? _lastMarkIdx;
 
@@ -84,41 +85,60 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
   @override
   void initState() {
     super.initState();
-    _posSub = _player.positionStream.listen((pos) async {
-      final end = _windowEnd;
-      if (end == null) return;
+    _initAudioSession();
+    _posSub = _player.positionStream.listen(_onPos);
+  }
 
-      final remaining = end - pos;
+  Future<void> _initAudioSession() async {
+    try {
+      final session = await AudioSession.instance;
+      await session.configure(const AudioSessionConfiguration.music());
 
-      // Start fade-out as we approach the end of the current window
-      if (!_segmentFadeStarted &&
-          remaining > Duration.zero &&
-          remaining <= _fadeOutDur) {
-        _segmentFadeStarted = true;
-        unawaited(_fadeTo(0.0, remaining));
-      }
+      // Android: prefer speaker, look like media playback
+      await _player.setAndroidAudioAttributes(const AndroidAudioAttributes(
+        contentType: AndroidAudioContentType.music,
+        usage: AndroidAudioUsage.media,
+        flags: AndroidAudioFlags.none,
+      ));
 
-      // Pause at the end of the window
-      if (remaining <= const Duration(milliseconds: 120)) {
-        _segmentFadeStarted = false;
-        _windowEnd = null;
-        await _player.pause();
-        _currVolume = _targetVolume;
-        await _player.setVolume(_targetVolume);
-      }
-    });
+      // Optional: pause if audio route changes to "noisy" (e.g., headphones unplugged)
+      session.becomingNoisyEventStream.listen((_) {
+        _player.pause();
+      });
+    } catch (e) {
+      // Safe to ignore if platform doesn't support or plugin not available
+      debugPrint('AudioSession init warning: $e');
+    }
+  }
+
+  void _onPos(Duration pos) async {
+    final end = _windowEnd;
+    if (end == null) return;
+    final remaining = end - pos;
+
+    if (!_segmentFadeStarted &&
+        remaining > Duration.zero &&
+        remaining <= _fadeOutDur) {
+      _segmentFadeStarted = true;
+      unawaited(_fadeTo(0.0, remaining));
+    }
+    if (remaining <= const Duration(milliseconds: 120)) {
+      _segmentFadeStarted = false;
+      _windowEnd = null;
+      await _player.pause();
+      _currVolume = _targetVolume;
+      await _player.setVolume(_targetVolume);
+    }
   }
 
   @override
   void dispose() {
     _posSub?.cancel();
-    _player.dispose().onError((e, st) {
-      debugPrint('AudioPlayer.dispose ignored: $e');
-    });
+    _player.dispose().onError((e, _) => debugPrint('dispose ignored: $e'));
     super.dispose();
   }
 
-  // ============= File picking & preparation =============
+  // ================= File picking (mobile-friendly) =================
 
   Future<void> _pickAndAddFiles() async {
     try {
@@ -126,22 +146,34 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
         type: FileType.custom,
         allowedExtensions: const ['m4b', 'm4a', 'mp3'],
         allowMultiple: true,
-        dialogTitle: 'Choose audiobook files (.m4b recommended)',
+        // withData: true, // enable only if you must support providers with no path/uri (can be memory heavy)
       );
       if (result == null || result.files.isEmpty) return;
 
       bool addedAny = false;
 
       for (final f in result.files) {
-        final path = f.path;
-        if (path == null) continue;
-
-        // Skip duplicates by path
-        if (_books.any((b) => b.path == path)) {
+        final uri = _resolveUriFromPlatformFile(f);
+        if (uri == null) {
+          // As a last resort (COMMENTED OUT to avoid big RAM usage):
+          // if (f.bytes != null) {
+          //   final dir = await getTemporaryDirectory();
+          //   final file = File('${dir.path}/${f.name}');
+          //   await file.writeAsBytes(f.bytes!, flush: true);
+          //   uri = Uri.file(file.path);
+          // }
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Could not access: ${f.name}')),
+            );
+          }
           continue;
         }
 
-        final dur = await _probeDuration(path);
+        // Skip duplicates
+        if (_books.any((b) => b.uri.toString() == uri.toString())) continue;
+
+        final dur = await _probeDuration(uri);
         if (dur == null) {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
@@ -161,17 +193,16 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
           continue;
         }
 
-        _books.add(_Book(name: f.name, path: path, duration: dur, marks: marks));
+        _books.add(_Book(name: f.name, uri: uri, duration: dur, marks: marks));
         addedAny = true;
       }
 
       if (!addedAny) return;
 
-      // If nothing was loaded before, load the first book into the player (no autoplay)
       if (_currentBookIndex == null && _books.isNotEmpty) {
         await _switchToBook(0, autoplay: false);
       } else {
-        setState(() {}); // refresh list count
+        setState(() {}); // refresh list
       }
     } catch (e) {
       if (!mounted) return;
@@ -181,10 +212,27 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     }
   }
 
-  Future<Duration?> _probeDuration(String path) async {
+  /// Try to get a usable URI from FilePicker's PlatformFile on mobile/desktop.
+  Uri? _resolveUriFromPlatformFile(PlatformFile f) {
+    // 1) Real filesystem path
+    if (f.path != null && f.path!.isNotEmpty && File(f.path!).existsSync()) {
+      return Uri.file(f.path!);
+    }
+    // 2) Some providers expose a content:// (Android) or file:// URI in identifier
+    if (f.identifier != null && f.identifier!.isNotEmpty) {
+      final maybe = Uri.tryParse(f.identifier!);
+      if (maybe != null && (maybe.scheme == 'content' || maybe.scheme == 'file')) {
+        return maybe;
+      }
+    }
+    // 3) Give up (or handle f.bytes by copying to temp — see commented code above)
+    return null;
+  }
+
+  Future<Duration?> _probeDuration(Uri uri) async {
     final p = AudioPlayer();
     try {
-      final d = await p.setFilePath(path);
+      final d = await p.setAudioSource(AudioSource.uri(uri));
       return d;
     } catch (_) {
       return null;
@@ -196,25 +244,19 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
   List<Duration> _buildStartMarks(Duration total, Duration increment) {
     final marks = <Duration>[];
     for (Duration start = Duration.zero; start < total; start += increment) {
-      // Only allow starts where at least 1 minute remains
-      if (total - start >= _minPlayableTail) {
-        marks.add(start);
-      }
+      if (total - start >= _minPlayableTail) marks.add(start);
     }
     return marks;
   }
 
-  // Switch current selection & load into player
   Future<void> _switchToBook(int idx, {bool autoplay = false}) async {
     if (idx < 0 || idx >= _books.length) return;
-
     final b = _books[idx];
 
     _fadeGen++; // cancel fades
     await _player.pause();
 
-    // Load the file into the main player
-    await _player.setFilePath(b.path);
+    await _player.setAudioSource(AudioSource.uri(b.uri));
 
     setState(() {
       _currentBookIndex = idx;
@@ -230,15 +272,13 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     await _player.setVolume(_targetVolume);
 
     if (autoplay) {
-      // Start from 0 or from a random mark? We'll keep it simple: from 0.
       await _player.seek(Duration.zero);
       await _playWithFadeIn();
     }
   }
 
-  // ============= Shuffle logic =============
+  // ================= Shuffle logic =================
 
-  // Shuffle within the currently selected file
   Future<void> _shuffleCurrent() async {
     final idx = _currentBookIndex;
     if (idx == null || _startMarks.isEmpty || _duration == null) return;
@@ -251,11 +291,9 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
         nextMark = _rng.nextInt(_startMarks.length);
       } while (_currentMarkIndex != null && nextMark == _currentMarkIndex);
     }
-
     await _playFromBookMark(idx, nextMark);
   }
 
-  // Shuffle across ALL files (pick random file + random 1-min mark)
   Future<void> _shuffleAll() async {
     if (_books.isEmpty) return;
 
@@ -263,7 +301,6 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     if (_books.length == 1) {
       fileIdx = 0;
     } else {
-      // Avoid same file twice in a row if possible
       do {
         fileIdx = _rng.nextInt(_books.length);
       } while (_lastFileIdx != null && fileIdx == _lastFileIdx);
@@ -276,7 +313,6 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     if (marks.length == 1) {
       markIdx = 0;
     } else {
-      // Avoid repeating the same file+mark pair
       do {
         markIdx = _rng.nextInt(marks.length);
       } while (_lastFileIdx == fileIdx && _lastMarkIdx != null && markIdx == _lastMarkIdx);
@@ -289,7 +325,6 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     if (fileIdx < 0 || fileIdx >= _books.length) return;
     final b = _books[fileIdx];
 
-    // If switching files, load it
     if (_currentBookIndex != fileIdx) {
       await _switchToBook(fileIdx, autoplay: false);
     }
@@ -308,7 +343,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
       _fileName = b.name;
     });
 
-    _fadeGen++; // cancel any ongoing fade
+    _fadeGen++;
     await _player.pause();
     await _player.seek(start);
     await _playWithFadeIn();
@@ -317,7 +352,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     _lastMarkIdx = markIdx;
   }
 
-  // ============= Fade helpers =============
+  // ================= Fades =================
 
   Future<void> _fadeTo(double target, Duration dur) async {
     _fadeGen++;
@@ -331,11 +366,11 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
       return;
     }
 
-    const frame = Duration(milliseconds: 16); // ~60fps
-    final steps =
-        (dur.inMilliseconds / frame.inMilliseconds).ceil().clamp(1, 300);
+    // Slightly slower loop to reduce platform message spam; still feels smooth
+    const frame = Duration(milliseconds: 40); // ~25 FPS
+    final steps = (dur.inMilliseconds / frame.inMilliseconds).ceil().clamp(1, 200);
     for (var i = 1; i <= steps; i++) {
-      if (gen != _fadeGen) return; // cancelled
+      if (gen != _fadeGen) return;
       final t = i / steps;
       final v = (start + delta * t).clamp(0.0, 1.0);
       _currVolume = v;
@@ -345,9 +380,21 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
   }
 
   Future<void> _playWithFadeIn() async {
-    _fadeGen++; // cancel fade-outs
-    _currVolume = 0.0;
-    await _player.setVolume(0.0);
+    _fadeGen++;
+
+    // Kick the audio path with a non-zero "epsilon" volume to avoid silent start
+    const epsilon = 0.003;
+    _currVolume = epsilon;
+    await _player.setVolume(epsilon);
+
+    // Ensure backend is ready (esp. on mobile) before starting fade
+    if (_player.processingState != ProcessingState.ready &&
+        _player.processingState != ProcessingState.buffering) {
+      await _player.processingStateStream.firstWhere(
+        (s) => s == ProcessingState.ready || s == ProcessingState.buffering,
+      );
+    }
+
     await _player.play();
     await _fadeTo(_targetVolume, _fadeInDur);
   }
@@ -356,7 +403,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     final d = custom ?? _fadeOutDur;
     await _fadeTo(0.0, d);
     await _player.pause();
-    _currVolume = _targetVolume; // prep for next start
+    _currVolume = _targetVolume;
     await _player.setVolume(_targetVolume);
   }
 
@@ -367,7 +414,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     await _player.setVolume(_targetVolume);
   }
 
-  // ============= Utils =============
+  // ================= UI helpers =================
 
   String _fmt(Duration d) {
     final h = d.inHours;
@@ -375,8 +422,8 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
     final s = d.inSeconds.remainder(60);
     if (h > 0) {
       return '${h.toString().padLeft(2, '0')}:'
-          '${m.toString().padLeft(2, '0')}:'
-          '${s.toString().padLeft(2, '0')}';
+             '${m.toString().padLeft(2, '0')}:'
+             '${s.toString().padLeft(2, '0')}';
     }
     return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
@@ -392,7 +439,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('BookShuffle (multi-file, 1-min shuffle)'),
+        title: const Text('BookShuffle (phone-ready)'),
         centerTitle: true,
       ),
       body: Padding(
@@ -420,7 +467,6 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
             ),
             const SizedBox(height: 12),
 
-            // File list
             if (_books.isNotEmpty)
               Container(
                 constraints: const BoxConstraints(maxHeight: 180),
@@ -447,7 +493,6 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
 
             const SizedBox(height: 12),
 
-            // Playback window chooser
             Row(
               children: [
                 const Text('Play window:'),
@@ -455,12 +500,7 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
                 DropdownButton<Duration>(
                   value: _windowLen,
                   items: _windowOptions
-                      .map(
-                        (d) => DropdownMenuItem(
-                          value: d,
-                          child: Text('${d.inMinutes} min'),
-                        ),
-                      )
+                      .map((d) => DropdownMenuItem(value: d, child: Text('${d.inMinutes} min')))
                       .toList(),
                   onChanged: (val) async {
                     if (val == null) return;
@@ -468,14 +508,11 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
                       _windowLen = val;
                       _segmentFadeStarted = false;
                     });
-                    // If we’re currently bounding playback, move the end to "now + window"
                     if (_windowEnd != null && _duration != null) {
                       final pos = await _player.position;
                       var newEnd = pos + _windowLen;
                       if (newEnd > _duration!) newEnd = _duration!;
-                      setState(() {
-                        _windowEnd = newEnd;
-                      });
+                      setState(() => _windowEnd = newEnd);
                     }
                   },
                 ),
@@ -483,14 +520,12 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
             ),
             const SizedBox(height: 12),
 
-            // Position + slider
             StreamBuilder<Duration>(
               stream: _player.positionStream,
               builder: (context, snap) {
                 final pos = snap.data ?? Duration.zero;
                 final max = dur?.inMilliseconds.toDouble() ?? 0.0;
-                final value =
-                    pos.inMilliseconds.clamp(0, max.toInt()).toDouble();
+                final value = pos.inMilliseconds.clamp(0, max.toInt()).toDouble();
 
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -502,10 +537,10 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
                         if (dur == null) return;
                         final seekTo = Duration(milliseconds: v.toInt());
                         setState(() {
-                          _windowEnd = null; // clear bounded window
+                          _windowEnd = null;
                           _segmentFadeStarted = false;
                         });
-                        _fadeGen++; // cancel active fade
+                        _fadeGen++;
                         _currVolume = _targetVolume;
                         await _player.setVolume(_targetVolume);
                         await _player.seek(seekTo);
@@ -515,10 +550,9 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         Text(_fmt(pos), style: theme.textTheme.bodySmall),
-                        Text(_fmt(dur ?? Duration.zero),
-                            style: theme.textTheme.bodySmall),
+                        Text(_fmt(dur ?? Duration.zero), style: theme.textTheme.bodySmall),
                       ],
-                    )
+                    ),
                   ],
                 );
               },
@@ -532,13 +566,12 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
                   final shownEnd = _windowEnd ?? (start + _windowLen);
                   final bounded = _minDuration(shownEnd - start, _windowLen);
                   return 'Current window: ${_fmt(start)} → ${_fmt(shownEnd)} '
-                      '(${bounded.inMinutes} min)';
+                         '(${bounded.inMinutes} min)';
                 }(),
                 style: theme.textTheme.bodyMedium,
               ),
             const Spacer(),
 
-            // Controls
             Wrap(
               alignment: WrapAlignment.center,
               spacing: 12,
@@ -568,9 +601,8 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
                       : null,
                   icon: StreamBuilder<bool>(
                     stream: _player.playingStream,
-                    builder: (_, snap) => Icon(
-                      (snap.data ?? false) ? Icons.pause : Icons.play_arrow,
-                    ),
+                    builder: (_, snap) =>
+                        Icon((snap.data ?? false) ? Icons.pause : Icons.play_arrow),
                   ),
                   label: const Text('Play/Pause'),
                 ),
@@ -596,12 +628,12 @@ class _OneScreenAudiobookState extends State<OneScreenAudiobook> {
 
 class _Book {
   final String name;
-  final String path;
+  final Uri uri;            // works for file:// & content://
   final Duration duration;
   final List<Duration> marks;
   const _Book({
     required this.name,
-    required this.path,
+    required this.uri,
     required this.duration,
     required this.marks,
   });
