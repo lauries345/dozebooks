@@ -1,41 +1,39 @@
-# DozeBooks (Flutter) — MVP Skeleton
+# Running on Android
 
-A cross‑platform audiobook player (Android + iOS) focused on **M4B playback**, **smart no‑repeat shuffle**, **sleep timer with fade + extend**, and **public‑domain discovery (LibriVox)**. Includes scaffolding for **one‑time unlock ($4.99)** and **banner ads**.
+## Prerequisites
+- **Developer options** and **USB debugging** enabled on the phone.
+- **Android platform-tools** installed (ADB available on PATH).
+- Trust dialog accepted when connecting the device via USB.
 
-## Quick Start
+## Check connected devices
+flutter devices
+Example output:
+Found 4 connected devices:
+  SM S931U1 (mobile) • RFCY41FVY4Z • android-arm64  • Android 15 (API 35)
+  Windows (desktop)  • windows     • windows-x64    • Microsoft Windows [Version 10.0.19045.6332]
+  Chrome (web)       • chrome      • web-javascript • Google Chrome 140.0.7339.129
+  Edge (web)         • edge        • web-javascript • Microsoft Edge 134.0.3124.83
 
-1) Install Flutter (stable), Android Studio/Xcode toolchains.
-2) Create a new Flutter project anywhere on your machine:
-   ```bash
-   flutter create doze_books
-   cd doze_books
-   ```
-3) Replace the generated `lib/` and `pubspec.yaml` with the ones in this zip:
-   - Copy the **lib/** folder here
-   - Overwrite **pubspec.yaml**
-4) Install dependencies:
-   ```bash
-   flutter pub get
-   ```
-5) iOS: enable **Background Modes → Audio, AirPlay, and Picture in Picture**.
-   - In Xcode → Runner target → Signing & Capabilities → + Capability → Background Modes → check “Audio, AirPlay, and Picture in Picture”
-6) Android: ensure the app targets SDK 34+; Flutter defaults are fine.
-7) Run:
-   ```bash
-   flutter run
-   ```
+## Run the app on your phone
+Use the device ID shown in the list above (in this case `RFCY41FVY4Z`):
+flutter run -d RFCY41FVY4Z
 
-## Notes
+## Useful variants
+- **Hot reload/restart**:  
+  While running, press `r` (reload) or `R` (restart) in the terminal.
+- **Specify entrypoint file**:
+  flutter run -d RFCY41FVY4Z -t lib/main.dart
+- **Profile mode**:
+  flutter run -d RFCY41FVY4Z --profile
+- **Release mode**:
+  flutter run -d RFCY41FVY4Z --release
 
-- **M4B support**: handled by platform players (ExoPlayer/AVPlayer) via `just_audio`.
-- **Background & media controls**: powered by `audio_service` + `just_audio`.
-- **Downloads**: simple HTTP download via `dio` (MVP); consider background isolate / plugins later.
-- **Premium**: stubbed with `in_app_purchase`. Wire real product IDs in both stores.
-- **Ads**: `google_mobile_ads` banner widget used on Discover page when not premium.
-
-## Roadmap (after MVP)
-
-- Chapter parsing from MP4 atoms for M4B chapter list.
-- Background downloads + pause/resume; Android `DownloadManager` and iOS background tasks.
-- Cloud sync for positions (optional subscription later).
-- Archive.org integration in Discover tab.
+## Troubleshooting
+- If the phone shows as *unauthorized*:  
+  Revoke USB debugging authorizations on the device, reconnect, and accept the RSA prompt.
+- If ADB is missing:  
+  Install [Android SDK Platform Tools](https://developer.android.com/studio/releases/platform-tools) and add them to your PATH.
+- If Gradle/build issues occur:
+  flutter doctor --android-licenses
+  flutter clean
+  flutter pub get
